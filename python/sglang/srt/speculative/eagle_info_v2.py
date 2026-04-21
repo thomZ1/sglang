@@ -14,6 +14,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
@@ -324,6 +325,18 @@ class EagleVerifyInputV2Mixin:
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
         device = batch.input_ids.device
+
+        # Apply the custom logit processors if registered in the sampling info.
+        # NOTE: keep this in sync with EagleVerifyInput.verify() in eagle_info.py
+        # (spec v1) and the equivalent calls in dflash_info.py / ngram_info.py;
+        # otherwise CLPs (e.g. KimiK25ReasoningEosRedirect*) are silently
+        # bypassed on the spec v2 verify path.
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(
+                next_token_logits,
+                sampling_info,
+                num_tokens_in_batch=self.draft_token_num,
+            )
 
         # Apply penalty
         # This is a relaxed version of penalties for speculative decoding.

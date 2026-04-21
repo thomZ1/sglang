@@ -135,6 +135,165 @@ class DeepSeekR1ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     THINKING_END_TOKEN_ID: int = 128799
     NEW_LINE_TOKEN_ID: int = 201
 
+class KimiK25ReasoningEosRedirectLogitProcessor(CustomLogitProcessor):
+    """Redirect ``<|im_end|>`` to ``</think>`` while still inside ``<think>``.
+
+    Per-request rule: if the request's prefix already contains ``<think>`` but
+    has not yet emitted ``</think>``, then on any decoding/verify step where
+    the model's argmax for that request is ``<|im_end|>``, rewrite that row so
+    the only viable token is ``</think>``. This forces the reasoning section
+    to be properly closed before the request can terminate.
+
+    Works on both code paths:
+      * normal sampling  (``logits.shape[0] == len(custom_param_list)``)
+      * spec v2 verify   (``logits.shape[0] == len(custom_param_list) * draft_token_num``)
+    """
+
+    THINKING_START_TOKEN_ID: int = 163606
+    THINKING_END_TOKEN_ID: int = 163607
+
+    IM_END_TOKEN_ID: int = 163586
+    EOS_TOKEN_ID: int = 163585
+
+    TOOL_CALL_SECTION_BEGIN_TOKEN_ID: int = 163595
+    TOOL_CALL_SECTION_END_TOKEN_ID: int = 163596
+
+    TOOL_CALL_BEGIN_TOKEN_ID: int = 163597
+    TOOL_CALL_END_TOKEN_ID: int = 163599
+
+    # Toggle the per-trigger debug print. Cheap: only fires when at least one
+    # row actually gets redirected on this step.
+    DEBUG: bool = False
+
+    def _is_inside_thinking(self, req: "Req") -> bool:
+        """Return True iff <think> has been seen but </think> has not."""
+        # </think> can appear either in the prompt (rare) or in the generated
+        # tokens; check both to be safe.
+        if (
+            self.THINKING_END_TOKEN_ID in req.output_ids
+            or self.THINKING_END_TOKEN_ID in req.origin_input_ids
+        ):
+            return False
+        return (
+            self.THINKING_START_TOKEN_ID in req.origin_input_ids
+            or self.THINKING_START_TOKEN_ID in req.output_ids
+        )
+
+    def __call__(self, logits, custom_param_list: list[dict[str, Any]]):
+        if not custom_param_list:
+            return logits
+
+        n_rows = logits.shape[0]
+        n_params = len(custom_param_list)
+        # Standard sampling: tokens_per_req == 1.
+        # Spec v2 verify:    tokens_per_req == draft_token_num.
+        if n_params == 0 or n_rows % n_params != 0:
+            return logits
+        tokens_per_req = n_rows // n_params
+
+        # ---- Stage 1: cheap CPU filter -- which requests are still inside
+        # <think> and therefore eligible for redirection?
+        active_flags: List[bool] = [False] * n_params
+        any_active = False
+        for i, params in enumerate(custom_param_list):
+            if not params:
+                continue
+            req: Req = params.get("__req__")
+            if req is None:
+                continue
+            if self._is_inside_thinking(req):
+                active_flags[i] = True
+                any_active = True
+
+        if not any_active:
+            return logits
+
+        # ---- Stage 2: per-row mask = (request still in <think>) AND
+        # (argmax of this row is <|im_end|>). Only those rows get rewritten.
+        device = logits.device
+        # Expand request-level flags to row-level: each request owns
+        # tokens_per_req consecutive rows.
+        active_per_req = torch.tensor(active_flags, device=device, dtype=torch.bool)
+        active_rows = torch.repeat_interleave(active_per_req, tokens_per_req)
+
+        top_ids = logits.argmax(dim=-1)
+        redirect_mask = (top_ids == self.IM_END_TOKEN_ID) & active_rows
+        if not bool(redirect_mask.any()):
+            return logits
+
+        rows = redirect_mask.nonzero(as_tuple=True)[0]
+        # Full-mask + single-token release: works for greedy and any
+        # temperature/top-p/top-k sampler since only </think> is left.
+        logits[rows, :] = -float("inf")
+        logits[rows, self.THINKING_END_TOKEN_ID] = 0.0
+
+        if self.DEBUG:
+            print(
+                f"[k25-redirect] <|im_end|>-></think> rows={rows.tolist()} "
+                f"n_rows={n_rows} n_params={n_params} "
+                f"tokens_per_req={tokens_per_req}",
+                flush=True,
+            )
+
+        return logits
+
+
+
+class KimiK25ReasoningEosRedirectTestLogitProcessor(CustomLogitProcessor):
+    """Test variant: directional replacement of ``</think>`` with ``<|im_end|>``.
+
+    For every row whose argmax token is ``</think>`` (i.e. the model is about to
+    emit the thinking-end token at this step), this processor rewrites that
+    single row so the only viable token is ``<|im_end|>``. All other rows pass
+    through unchanged, so the rest of the request's behaviour is unaffected.
+
+    Works on both code paths:
+      * normal sampling (``logits.shape[0] == len(custom_param_list)``)
+      * spec v2 verify (``logits.shape[0] == len(custom_param_list) * draft_token_num``)
+
+    Purpose: end-to-end validation of the CLP plumbing (including
+    ``eagle_info_v2.EagleVerifyInput.sample``). Not meant for production.
+    """
+
+    THINKING_END_TOKEN_ID: int = 163607
+    EOS_TOKEN_ID: int = 163585
+    IM_END_TOKEN_ID: int = 163586
+
+    # Toggle the per-trigger debug print. Keep it cheap (only fires when at
+    # least one row is being redirected on this step).
+    DEBUG: bool = True
+
+    def __call__(self, logits, custom_param_list: list[dict[str, Any]]):
+        if not custom_param_list:
+            return logits
+
+        # Vectorised "directional replace": find every row whose top-1 token is
+        # </think> and rewrite just those rows to force <|im_end|>.
+        top_ids = logits.argmax(dim=-1)
+        redirect_mask = top_ids == self.THINKING_END_TOKEN_ID
+        if not bool(redirect_mask.any()):
+            return logits
+
+        rows = redirect_mask.nonzero(as_tuple=True)[0]
+        # Full-mask + single-token release: works for greedy AND for any
+        # temperature/top-p/top-k sampler since only <|im_end|> is left.
+        logits[rows, :] = -float("inf")
+        logits[rows, self.IM_END_TOKEN_ID] = 0.0
+
+        if self.DEBUG:
+            n_rows = logits.shape[0]
+            n_params = len(custom_param_list)
+            # In spec verify n_rows == n_params * draft_token_num, so report
+            # both to make path identification trivial in logs.
+            print(
+                f"[k25-test] redirect </think>-><|im_end|> rows={rows.tolist()} "
+                f"n_rows={n_rows} n_params={n_params} "
+                f"draft_token_num~={n_rows // max(n_params, 1)}",
+                flush=True,
+            )
+
+        return logits
+
 
 # Adapted from DeepSeek's implementation: https://github.com/deepseek-ai/DeepSeek-OCR/blob/main/DeepSeek-OCR-master/DeepSeek-OCR-vllm/process/ngram_norepeat.py
 class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):

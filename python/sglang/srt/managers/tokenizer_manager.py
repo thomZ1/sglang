@@ -880,6 +880,37 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     "Please set `--enable-return-hidden-states` to enable this feature."
                 )
             if (
+                (
+                    self.server_args.enable_k25_reasoning_eos_redirect
+                    or self.server_args.enable_k25_reasoning_eos_redirect_test
+                )
+                and not obj.custom_logit_processor
+            ):
+                # Test variant takes precedence for easy end-to-end validation.
+                if self.server_args.enable_k25_reasoning_eos_redirect_test:
+                    from sglang.srt.sampling.custom_logit_processor import (
+                        KimiK25ReasoningEosRedirectTestLogitProcessor as _Proc,
+                    )
+                else:
+                    from sglang.srt.sampling.custom_logit_processor import (
+                        KimiK25ReasoningEosRedirectLogitProcessor as _Proc,
+                    )
+
+                obj.custom_logit_processor = _Proc.to_str()
+                # The CLP needs ``__req__`` inside ``sampling_params.custom_params``
+                # so it can read req.output_ids etc. Req.__init__ only injects
+                # ``__req__`` when ``custom_params`` is already a dict, so seed
+                # an empty dict here when the user did not supply one.
+                if isinstance(obj.sampling_params, dict):
+                    existing = obj.sampling_params.get("custom_params")
+                    if not isinstance(existing, dict):
+                        obj.sampling_params["custom_params"] = {}
+                logger.info(
+                    "[k25-eos-redirect] auto-injected %s for rid=%s",
+                    _Proc.__name__,
+                    getattr(obj, "rid", None),
+                )
+            if (
                 obj.custom_logit_processor
                 and not self.server_args.enable_custom_logit_processor
             ):

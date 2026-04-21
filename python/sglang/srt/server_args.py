@@ -667,6 +667,8 @@ class ServerArgs:
     enable_draft_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
+    enable_k25_reasoning_eos_redirect: bool = False
+    enable_k25_reasoning_eos_redirect_test: bool = False
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     enforce_shared_experts_fusion: bool = False
@@ -871,6 +873,14 @@ class ServerArgs:
 
         # Handle debug utilities.
         self._handle_debug_utils()
+
+        # Auto-enable custom logit processor when k25 reasoning eos redirect is on,
+        # so OpenAI clients do not need to install sglang or pass extra_body.
+        if (
+            self.enable_k25_reasoning_eos_redirect
+            or self.enable_k25_reasoning_eos_redirect_test
+        ):
+            self.enable_custom_logit_processor = True
 
         # Handle any other necessary validations.
         self._handle_other_validations()
@@ -5955,6 +5965,16 @@ class ServerArgs:
             "--enable-custom-logit-processor",
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
+        parser.add_argument(
+            "--enable-k25-reasoning-eos-redirect",
+            action="store_true",
+            help="Auto-inject KimiK25ReasoningEosRedirectLogitProcessor into every request, so OpenAI clients do not need to install sglang and pass it via extra_body.",
+        )
+        parser.add_argument(
+            "--enable-k25-reasoning-eos-redirect-test",
+            action="store_true",
+            help="Debug/test mode: auto-inject the TEST variant that unconditionally rewrites the FIRST terminator token into </think>, letting the model continue until the second terminator. Use this to validate the CLP plumbing end-to-end; takes precedence over --enable-k25-reasoning-eos-redirect.",
         )
         parser.add_argument(
             "--flashinfer-mla-disable-ragged",
