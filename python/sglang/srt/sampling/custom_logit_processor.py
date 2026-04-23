@@ -136,13 +136,20 @@ class DeepSeekR1ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     NEW_LINE_TOKEN_ID: int = 201
 
 class KimiK25ReasoningEosRedirectLogitProcessor(CustomLogitProcessor):
-    """Redirect ``<|im_end|>`` to ``</think>`` while still inside ``<think>``.
+    """Guard ``<|im_end|>`` while the request is still inside ``<think>``.
 
-    Per-request rule: if the request's prefix already contains ``<think>`` but
-    has not yet emitted ``</think>``, then on any decoding/verify step where
-    the model's argmax for that request is ``<|im_end|>``, rewrite that row so
-    the only viable token is ``</think>``. This forces the reasoning section
-    to be properly closed before the request can terminate.
+    Per-request, two-level guard (applied on every decoding/verify step where
+    ``<think>`` has been seen but ``</think>`` has not):
+
+    1. **Ban**: ``<|im_end|>`` is forced to ``-inf`` on every row owned by the
+       request, so no sampler (greedy / top-p / top-k / temperature) can ever
+       emit it -- this closes the top-p/temperature leakage where
+       ``<|im_end|>`` may sit in the top-p tail even when it isn't argmax.
+
+    2. **Redirect**: on any row whose argmax is ``<|im_end|>`` (i.e. the model
+       clearly wants to terminate), we additionally rewrite the row so the
+       only viable token is ``</think>``. Once ``</think>`` is emitted the
+       guard is released on subsequent steps automatically.
 
     Works on both code paths:
       * normal sampling  (``logits.shape[0] == len(custom_param_list)``)
@@ -208,32 +215,47 @@ class KimiK25ReasoningEosRedirectLogitProcessor(CustomLogitProcessor):
         if not any_active:
             return logits
 
-        # ---- Stage 2: per-row mask = (request still in <think>) AND
-        # (argmax of this row is <|im_end|>). Only those rows get rewritten.
+        # ---- Stage 2: expand request-level active flags to row-level.
+        # Each request owns ``tokens_per_req`` consecutive rows.
         device = logits.device
-        # Expand request-level flags to row-level: each request owns
-        # tokens_per_req consecutive rows.
         active_per_req = torch.tensor(active_flags, device=device, dtype=torch.bool)
         active_rows = torch.repeat_interleave(active_per_req, tokens_per_req)
 
+        # ---- Stage 3: decide which active rows should be "redirected"
+        # (argmax == <|im_end|>, closed with </think>) vs only "banned"
+        # (any other row on an active request, where we just suppress
+        # <|im_end|> so it cannot leak through top-p / temperature).
         top_ids = logits.argmax(dim=-1)
         redirect_mask = (top_ids == self.IM_END_TOKEN_ID) & active_rows
-        if not bool(redirect_mask.any()):
+        ban_only_mask = active_rows & ~redirect_mask
+
+        # Fast path: nothing to do (no request inside <think> has a row that
+        # needs touching -- effectively impossible if active_rows.any() since
+        # banning always applies, but keep the guard for safety).
+        if not bool(active_rows.any()):
             return logits
 
-        rows = redirect_mask.nonzero(as_tuple=True)[0]
-        # Full-mask + single-token release: works for greedy and any
-        # temperature/top-p/top-k sampler since only </think> is left.
-        logits[rows, :] = -float("inf")
-        logits[rows, self.THINKING_END_TOKEN_ID] = 0.0
+        # (a) Ban: suppress <|im_end|> on every active row. Cheap, vectorised.
+        if bool(ban_only_mask.any()):
+            ban_rows = ban_only_mask.nonzero(as_tuple=True)[0]
+            logits[ban_rows, self.IM_END_TOKEN_ID] = -float("inf")
 
-        if self.DEBUG:
-            print(
-                f"[k25-redirect] <|im_end|>-></think> rows={rows.tolist()} "
-                f"n_rows={n_rows} n_params={n_params} "
-                f"tokens_per_req={tokens_per_req}",
-                flush=True,
-            )
+        # (b) Redirect: full-mask + single-token release so ONLY </think> can
+        # be emitted on that step, regardless of sampler configuration.
+        if bool(redirect_mask.any()):
+            redirect_rows = redirect_mask.nonzero(as_tuple=True)[0]
+            logits[redirect_rows, :] = -float("inf")
+            logits[redirect_rows, self.THINKING_END_TOKEN_ID] = 0.0
+
+            if self.DEBUG:
+                print(
+                    f"[k25-redirect] <|im_end|>-></think> "
+                    f"redirect_rows={redirect_rows.tolist()} "
+                    f"ban_rows={int(ban_only_mask.sum().item())} "
+                    f"n_rows={n_rows} n_params={n_params} "
+                    f"tokens_per_req={tokens_per_req}",
+                    flush=True,
+                )
 
         return logits
 
