@@ -15,6 +15,7 @@ from sglang.srt.sampling.custom_logit_processor import (
     DeepseekOCRNoRepeatNGramLogitProcessor,
     DeepSeekR1ThinkingBudgetLogitProcessor,
     DisallowedTokensLogitsProcessor,
+    KimiK25ReasoningEosRedirectLogitProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
     _cache_from_str,
 )
@@ -251,6 +252,54 @@ class TestThinkingBudgetLogitProcessor(CustomTestCase):
         # Budget exceeded, last token (100) is not newline → force newline
         self.assertEqual(result[0, NL].item(), 0.0)
         self.assertTrue(torch.isinf(result[0, 0]) and result[0, 0] < 0)
+
+
+class TestKimiK25ReasoningEosRedirectLogitProcessor(CustomTestCase):
+    START = KimiK25ReasoningEosRedirectLogitProcessor.THINKING_START_TOKEN_ID
+    END = KimiK25ReasoningEosRedirectLogitProcessor.THINKING_END_TOKEN_ID
+    IM_END = KimiK25ReasoningEosRedirectLogitProcessor.IM_END_TOKEN_ID
+    VOCAB = KimiK25ReasoningEosRedirectLogitProcessor.THINKING_END_TOKEN_ID + 4
+
+    def setUp(self):
+        self.processor = KimiK25ReasoningEosRedirectLogitProcessor()
+
+    def _logits(self, batch_size=1, vocab_size=None):
+        return torch.zeros(batch_size, vocab_size or self.VOCAB)
+
+    def test_redirects_im_end_to_think_end(self):
+        req = _make_req(origin_input_ids=[self.START], output_ids=[42])
+        logits = self._logits()
+        logits[0, self.IM_END] = 10.0
+        result = self.processor(logits, [{"__req__": req}])
+
+        self.assertEqual(result[0, self.END].item(), 0.0)
+        self.assertTrue(
+            torch.isinf(result[0, self.IM_END]) and result[0, self.IM_END] < 0
+        )
+
+    def test_spec_v2_only_guards_until_first_close(self):
+        req = _make_req(origin_input_ids=[self.START], output_ids=[42])
+        logits = self._logits(batch_size=3)
+        logits[0, 100] = 5.0
+        logits[1, self.END] = 6.0
+        logits[2, self.IM_END] = 7.0
+
+        result = self.processor(logits, [{"__req__": req}])
+
+        self.assertTrue(
+            torch.isinf(result[0, self.IM_END]) and result[0, self.IM_END] < 0
+        )
+        self.assertEqual(result[1, self.END].item(), 6.0)
+        self.assertEqual(result[2, self.IM_END].item(), 7.0)
+
+    def test_skips_when_vocab_does_not_cover_special_tokens(self):
+        req = _make_req(origin_input_ids=[self.START], output_ids=[42])
+        logits = self._logits(vocab_size=self.IM_END)
+        original = logits.clone()
+
+        result = self.processor(logits, [{"__req__": req}])
+
+        self.assertTrue(torch.equal(result, original))
 
 
 # DeepseekOCRNoRepeatNGramLogitProcessor

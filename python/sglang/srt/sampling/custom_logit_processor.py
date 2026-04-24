@@ -1,4 +1,5 @@
 import json
+import logging
 from abc import ABC, abstractmethod
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
@@ -9,6 +10,9 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=None)
@@ -135,6 +139,7 @@ class DeepSeekR1ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     THINKING_END_TOKEN_ID: int = 128799
     NEW_LINE_TOKEN_ID: int = 201
 
+
 class KimiK25ReasoningEosRedirectLogitProcessor(CustomLogitProcessor):
     """Guard ``<|im_end|>`` while the request is still inside ``<think>``.
 
@@ -172,6 +177,10 @@ class KimiK25ReasoningEosRedirectLogitProcessor(CustomLogitProcessor):
     # row actually gets redirected on this step.
     DEBUG: bool = False
 
+    _ACTION_NONE: int = 0
+    _ACTION_BAN_IM_END: int = 1
+    _ACTION_REDIRECT_TO_THINK_END: int = 2
+
     def _is_inside_thinking(self, req: "Req") -> bool:
         """Return True iff <think> has been seen but </think> has not."""
         # </think> can appear either in the prompt (rare) or in the generated
@@ -186,8 +195,53 @@ class KimiK25ReasoningEosRedirectLogitProcessor(CustomLogitProcessor):
             or self.THINKING_START_TOKEN_ID in req.output_ids
         )
 
+    def _has_valid_vocab(self, logits: torch.Tensor) -> bool:
+        vocab_size = logits.shape[-1]
+        required_token_ids = (
+            self.IM_END_TOKEN_ID,
+            self.THINKING_END_TOKEN_ID,
+        )
+        max_required_token_id = max(required_token_ids)
+        if max_required_token_id < vocab_size:
+            return True
+
+        logger.warning(
+            "[k25-eos-redirect] skip processor because vocab_size=%d does not cover "
+            "required token ids %s",
+            vocab_size,
+            sorted(required_token_ids),
+        )
+        return False
+
+    def _plan_actions_for_active_reqs(
+        self,
+        active_top_ids_cpu: torch.Tensor,
+        tokens_per_req: int,
+    ) -> torch.Tensor:
+        actions = torch.zeros_like(active_top_ids_cpu, dtype=torch.int8)
+
+        for req_row in range(active_top_ids_cpu.shape[0]):
+            thinking_open = True
+            for k in range(tokens_per_req):
+                if not thinking_open:
+                    break
+
+                top = int(active_top_ids_cpu[req_row, k])
+                if top == self.THINKING_END_TOKEN_ID:
+                    thinking_open = False
+                elif top == self.IM_END_TOKEN_ID:
+                    actions[req_row, k] = self._ACTION_REDIRECT_TO_THINK_END
+                    thinking_open = False
+                else:
+                    actions[req_row, k] = self._ACTION_BAN_IM_END
+
+        return actions
+
     def __call__(self, logits, custom_param_list: list[dict[str, Any]]):
         if not custom_param_list:
+            return logits
+
+        if not self._has_valid_vocab(logits):
             return logits
 
         n_rows = logits.shape[0]
@@ -231,59 +285,44 @@ class KimiK25ReasoningEosRedirectLogitProcessor(CustomLogitProcessor):
         # guarded any more.
         #
         # draft_token_num is small (typically <= 8) so per-request iteration
-        # is cheap.
-        # Compute argmax once on device to avoid repeated kernel launches.
-        top_ids_cpu = logits.argmax(dim=-1).tolist()
-
-        redirect_rows: List[int] = []
-        ban_rows: List[int] = []
-
-        for req_idx in active_req_indices:
-            base = req_idx * tokens_per_req
-            thinking_open = True
-            for k in range(tokens_per_req):
-                if not thinking_open:
-                    # Already left <think> earlier in this same verify window;
-                    # the rest of the rows belong to "after </think>" content
-                    # and must be left untouched (otherwise we'd produce
-                    # duplicated </think> markers).
-                    break
-                row = base + k
-                top = top_ids_cpu[row]
-                if top == self.THINKING_END_TOKEN_ID:
-                    # Natural close; nothing to do, just stop guarding the
-                    # remaining draft rows of this request.
-                    thinking_open = False
-                elif top == self.IM_END_TOKEN_ID:
-                    # The model wants to terminate while still inside <think>
-                    # -- redirect this single row to </think> and close the
-                    # guard for subsequent rows in this window.
-                    redirect_rows.append(row)
-                    thinking_open = False
-                else:
-                    # Plain in-think token: just ban <|im_end|> so it can't
-                    # leak through top-p / temperature.
-                    ban_rows.append(row)
+        # is cheap. Keep the host/device round-trips narrow by only copying
+        # argmax results for active requests, then upload one compact action
+        # matrix back to the device.
+        active_req_indices_t = torch.tensor(
+            active_req_indices, device=logits.device, dtype=torch.long
+        )
+        active_top_ids_cpu = (
+            logits.reshape(n_params, tokens_per_req, -1)
+            .index_select(0, active_req_indices_t)
+            .argmax(dim=-1)
+            .cpu()
+        )
+        action_matrix = self._plan_actions_for_active_reqs(
+            active_top_ids_cpu, tokens_per_req
+        ).to(device=logits.device)
+        row_offsets = active_req_indices_t[:, None] * tokens_per_req + torch.arange(
+            tokens_per_req, device=logits.device
+        )
+        ban_rows = row_offsets[action_matrix == self._ACTION_BAN_IM_END]
+        redirect_rows = row_offsets[
+            action_matrix == self._ACTION_REDIRECT_TO_THINK_END
+        ]
 
         # (a) Ban: suppress <|im_end|> on every still-in-think row.
-        if ban_rows:
-            ban_rows_t = torch.tensor(ban_rows, device=logits.device, dtype=torch.long)
-            logits[ban_rows_t, self.IM_END_TOKEN_ID] = -float("inf")
+        if ban_rows.numel() > 0:
+            logits[ban_rows, self.IM_END_TOKEN_ID] = -float("inf")
 
         # (b) Redirect: full-mask + single-token release so ONLY </think> can
         # be emitted on that step, regardless of sampler configuration.
-        if redirect_rows:
-            redirect_rows_t = torch.tensor(
-                redirect_rows, device=logits.device, dtype=torch.long
-            )
-            logits[redirect_rows_t, :] = -float("inf")
-            logits[redirect_rows_t, self.THINKING_END_TOKEN_ID] = 0.0
+        if redirect_rows.numel() > 0:
+            logits[redirect_rows, :] = -float("inf")
+            logits[redirect_rows, self.THINKING_END_TOKEN_ID] = 0.0
 
             if self.DEBUG:
                 print(
                     f"[k25-redirect] <|im_end|>-></think> "
-                    f"redirect_rows={redirect_rows} "
-                    f"ban_rows={len(ban_rows)} "
+                    f"redirect_rows={redirect_rows.tolist()} "
+                    f"ban_rows={ban_rows.numel()} "
                     f"n_rows={n_rows} n_params={n_params} "
                     f"tokens_per_req={tokens_per_req}",
                     flush=True,
